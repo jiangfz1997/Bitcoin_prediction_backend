@@ -13,9 +13,14 @@ from keras.layers import Layer
 from keras import backend as K
 import pandas as pd
 import pandas_ta as ta
-import traceback
+from django.utils import timezone
+from .models import MarketCandle, ModelPrediction
+from datetime import timezone as dt_timezone
 
 
+# ignore FutureWarnings from sklearn
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
 class SimpleAttention(Layer):
     def build(self, input_shape):
         self.W = self.add_weight(shape=(input_shape[-1],1),
@@ -65,54 +70,99 @@ def fetch_klines(start_ts: int, end_ts: int, symbol="BTCUSDT", interval="1m"):
     response = requests.get(url, params=params)
     ks = response.json()
     return [(int(k[6] // 1000), float(k[2]), float(k[3]), float(k[4]), float(k[5])) for k in ks]
-def get_or_fetch_recent_candles(n=60) -> deque:
-    latest = MarketCandle.objects.order_by('-timestamp')[:n * 2]
-    df = pd.DataFrame.from_records(
-        latest.values("timestamp", "close", "high", "low", "volume")
-    )
-    df = df.sort_values("timestamp")
+def get_or_fetch_recent_candles(n=60, symbol="BTCUSDT", end_dt: datetime.datetime | None = None) -> deque:
+    """
+    拉取最近 n 根 1min K 线，自动补齐缺口并返回 deque 供模型输入。
+    - 按 symbol 过滤，匹配唯一键 (symbol, timestamp)
+    - 去重：同一 timestamp 留最后一条
+    - 统一 tz：确保 index 和 date_range 一致
+    - 缺口用远端 fetch_klines(start_ts, end_ts) 补齐；写库用 tz-aware 时间
+    """
 
-    # 构建 time index
-    all_timestamps = pd.date_range(
-        end=df['timestamp'].iloc[-1],
-        periods=n,
-        freq='1min'
-    )
 
-    df = df.set_index('timestamp').reindex(all_timestamps)
+    # 1) 先读一批数据（多取一点，给补数留空间）
+    qs = (MarketCandle.objects
+          .filter(symbol=symbol)
+          .order_by('-timestamp')
+          .values('timestamp', 'close', 'high', 'low', 'volume')[:max(n*3, n+10)])
+    df = pd.DataFrame.from_records(qs)
+    if df.empty:
+        return deque(maxlen=n)
 
-    missing_ts = df[df['close'].isna()].index.to_list()
+    # 2) 排序、去重（防止重复索引导致 reindex 报错）
+    df = df.sort_values('timestamp')
+    df = df.drop_duplicates(subset='timestamp', keep='last')
 
+    # 3) 构造完整时间序列（与数据同 tz）
+    tz = df['timestamp'].dt.tz
+    end_ts = df['timestamp'].iloc[-1]
+    all_ts = pd.date_range(end=end_ts, periods=n, freq='1min', tz=tz)
+
+    # 4) 对齐索引并标出缺口
+    df = df.set_index('timestamp').reindex(all_ts)
+    missing_ts = df.index[df['close'].isna()].to_list()
+
+    # 5) 如有缺口，调用远端接口补数后再重新取一次
     if missing_ts:
-        print(f"⚠️ 缺失数据条数: {len(missing_ts)}，开始补全")
+        # 合并连续缺口为一个段，减少请求次数（简单分段）
+        ranges = []
+        if missing_ts:
+            start = missing_ts[0]
+            prev = missing_ts[0]
+            for t in missing_ts[1:]:
+                if (t - prev) == pd.Timedelta(minutes=1):
+                    prev = t
+                else:
+                    ranges.append((start, prev))
+                    start, prev = t, t
+            ranges.append((start, prev))
 
-        start_ts = int(missing_ts[0].timestamp())
-        end_ts   = int(missing_ts[-1].timestamp()) + 60
+        for st, et in ranges:
+            # fetch_klines 习惯是 [start, end) 秒；右边 +60 覆盖末尾分钟
+            start_sec = int(st.timestamp())
+            end_sec = int(et.timestamp()) + 60
+            fetched = fetch_klines(start_sec, end_sec, symbol=symbol)
 
-        fetched = fetch_klines(start_ts, end_ts)
-        for ts, high, low, close, volume in fetched:
-            MarketCandle.objects.update_or_create(
-                timestamp=datetime.utcfromtimestamp(ts),
-                defaults={
-                    "close": close,  # ✅ 改为 MarketCandle 的字段名
-                    "high": high,
-                    "low": low,
-                    "volume": volume
-                }
-            )
+            # 写库时一定带 symbol，timestamp 用 tz-aware
+            for ts, high, low, close, volume in fetched:
+                MarketCandle.objects.update_or_create(
+                    symbol=symbol,
+                    timestamp=make_aware(datetime.datetime.utcfromtimestamp(ts)),
+                    defaults={
+                        'close': close,
+                        'high': high,
+                        'low': low,
+                        'volume': volume
+                    }
+                )
 
-        return get_or_fetch_recent_candles(n)
+        # 补完再重新拉一次，走统一流程
+        qs = (MarketCandle.objects
+              .filter(symbol=symbol)
+              .order_by('-timestamp')
+              .values('timestamp', 'close', 'high', 'low', 'volume')[:max(n*3, n+10)])
+        df = pd.DataFrame.from_records(qs).sort_values('timestamp').drop_duplicates('timestamp', keep='last')
+        tz = df['timestamp'].dt.tz
+        end_ts = df['timestamp'].iloc[-1]
+        all_ts = pd.date_range(end=end_ts, periods=n, freq='1min', tz=tz)
+        df = df.set_index('timestamp').reindex(all_ts).ffill()
 
-    candle_buf = deque(maxlen=n)
+    else:
+        # 没缺口就前向填充一下（个别指标字段可能有空）
+        df = df.ffill()
+
+    # 6) 仅保留尾部 n 条，转为 deque
+    df = df.tail(n)
+    out = deque(maxlen=n)
     for ts, row in df.iterrows():
-        candle_buf.append({
-            "timestamp": ts,
-            "close": row["close"],
-            "high": row["high"],
-            "low": row["low"],
-            "volume": row["volume"]
+        out.append({
+            'timestamp': ts,            # tz-aware
+            'close': float(row['close']),
+            'high': float(row['high']),
+            'low': float(row['low']),
+            'volume': float(row['volume']),
         })
-    return candle_buf
+    return out
 
 def fetch_closed_klines(limit=1):
     params = {"symbol": SYMBOL, "interval": "1m", "limit": limit}
@@ -138,21 +188,23 @@ def build_input_from_candles(candle_buf, window_size=30):
 
     df = pd.DataFrame(candle_buf)
 
-
+    # def log_na(step):
+    #     print(f"[DEBUG] After {step}: NaN counts:\n{df.isna().sum()}\n")
     df["return"] = np.log(df["close"] / df["close"].shift(1))
     df["hl_spread"] = df["high"] - df["low"]
-    df["price_delta"] = df["close"] - df["close"].shift(1)
-    df["tr"] = np.maximum(
-        df["high"] - df["low"],
-        np.maximum(
-            abs(df["high"] - df["close"].shift(1)),
-            abs(df["low"] - df["close"].shift(1))
-        )
-    )
-    df["vol_change"] = df["volume"].pct_change()
+    # df["price_delta"] = df["close"] - df["close"].shift(1)
+    # df["tr"] = np.maximum(
+    #     df["high"] - df["low"],
+    #     np.maximum(
+    #         abs(df["high"] - df["close"].shift(1)),
+    #         abs(df["low"] - df["close"].shift(1))
+    #     )
+    # )
+    # df["vol_change"] = df["volume"].pct_change()
     df["rsi"] = ta.rsi(df["close"], length=14)
-    df["ema20"] = ta.ema(df["close"], length=20)
-    df["std_60min"] = df["close"].rolling(window=60).std()
+    # df["ema20"] = ta.ema(df["close"], length=20)
+    # df["std_60min"] = df["close"].rolling(window=60).std()
+    df["volatility"] = df["return"].rolling(window=window_size).std()
 
     df.dropna(inplace=True)
 
@@ -167,3 +219,193 @@ def build_input_from_candles(candle_buf, window_size=30):
     x = features_scaled[-window_size:]  # shape: (30, 5)
     x = x.reshape(1, window_size, x.shape[1])   # shape: (1, 30, 5)
     return x
+
+
+def _to_utc(dt_in):
+    if dt_in is None:
+        return None
+    if dt_in.tzinfo is None:
+        return timezone.make_aware(dt_in, dt_timezone.utc)
+    return dt_in.astimezone(dt_timezone.utc)
+
+def update_bias_and_smooth(
+    symbol: str,
+    model_name: str,
+    step_index: int = 1,
+    window: int = 20,                 # 取最近 N 个点
+    alpha: float = 0.2,               # EWMA 学习率
+    pred_raw: float | None = None,    # 本次模型原始预测（必传才会返回平滑后的预测）
+    bias_prev: float = 0.0,           # 旧的 bias（从你的校准表取）
+    end_dt: datetime.datetime | None = None # 截止时间，默认用“上一根收盘”
+):
+    """
+    返回:
+      {
+        "timestamps": [...],                # 对齐后的时间戳（:59）
+        "close_series": np.array,           # 实际收盘
+        "pred_series": np.array,            # 历史已校正预测 pred_corr
+        "mean_err": float,                  # 窗口平均误差 (close - pred)
+        "bias_new": float,                  # 用 mean_err 做 EWMA 后的新 bias
+        "sigma_real": float,                # 实际波动率（log-return 的 std）
+        "sigma_pred": float,                # 预测波动率（log-return 的 std）
+        "smooth_factor": float,             # 平滑系数 = min(1, sigma_real/sigma_pred)
+        "pred_smoothed": float | None,      # 用平滑系数+新bias 得到的本次校正预测
+        "last_pred_corr": float | None      # 最近一个已存的校正预测（用于平滑的起点）
+      }
+    """
+    # —— 1) 取最近 window 条预测，拿到它们的 predicted_for 作为对齐锚（:59） —— #
+    pred_qs = (ModelPrediction.objects
+               .filter(symbol=symbol, model_name=model_name, step_index=step_index)
+               .order_by("-predicted_for"))
+
+    if end_dt:
+        end_dt = _to_utc(end_dt)
+        pred_qs = pred_qs.filter(predicted_for__lte=end_dt)
+
+    preds = list(pred_qs[:window][::-1])  # 时间升序
+    if not preds:
+        return {
+            "timestamps": [],
+            "close_series": np.array([]),
+            "pred_series": np.array([]),
+            "mean_err": 0.0,
+            "bias_new": bias_prev,
+            "sigma_real": 0.0,
+            "sigma_pred": 0.0,
+            "smooth_factor": 1.0,
+            "pred_smoothed": None,
+            "last_pred_corr": None,
+        }
+
+    ts_list = [p.predicted_for for p in preds]
+
+    # —— 2) 取同时间戳的真实 close（你的库里 timestamp 也是 :59） —— #
+    candles = (MarketCandle.objects
+               .filter(symbol=symbol, timestamp__in=ts_list)
+               .values("timestamp", "close"))
+    close_map = {c["timestamp"]: float(c["close"]) for c in candles}
+
+    # 对齐：只保留两边都有的数据点
+    aligned = [(t, close_map[t], float(p.pred_corr) if p.pred_corr is not None else None)
+               for t, p in zip(ts_list, preds) if t in close_map and p.pred_corr is not None]
+
+    if len(aligned) < max(5, int(window/3)):
+        # 点太少，避免数值不稳
+        close_series = np.array([a[1] for a in aligned], dtype=float)
+        pred_series  = np.array([a[2] for a in aligned], dtype=float)
+    else:
+        close_series = np.array([a[1] for a in aligned], dtype=float)
+        pred_series  = np.array([a[2] for a in aligned], dtype=float)
+
+    # —— 3) 误差均值 + EWMA 更新 bias —— #
+    if len(close_series) == 0:
+        mean_err = 0.0
+        bias_new = bias_prev
+    else:
+        mean_err = float(np.mean(close_series - pred_series))
+        bias_new = (1 - alpha) * bias_prev + alpha * mean_err
+
+    # —— 4) 用 log-return 的 std 当“窗口波动率” —— #
+    def _ret_std(x: np.ndarray) -> float:
+        if len(x) < 2:
+            return 0.0
+        r = np.diff(np.log(x))
+        if len(r) == 0:
+            return 0.0
+        return float(np.std(r))
+
+    sigma_real = _ret_std(close_series)
+    sigma_pred = _ret_std(pred_series)
+    smooth_factor = 1.0 if sigma_pred <= 0 else min(1.0, sigma_real / (sigma_pred + 1e-8))
+
+    # —— 5) 生成“平滑后的本次预测” —— #
+    last_pred_corr = float(pred_series[-1]) if len(pred_series) > 0 else None
+    pred_smoothed = None
+    if pred_raw is not None and last_pred_corr is not None:
+        # 先做 bias 纠偏，再做振幅平滑（以 last_pred_corr 为锚，避免跳变）
+        pred_bias_corrected = float(pred_raw) + bias_new  # 你的 err 定义是 actual - pred
+        pred_smoothed = last_pred_corr + (pred_bias_corrected - last_pred_corr) * smooth_factor
+
+    return {
+        "timestamps": [a[0] for a in aligned],
+        "close_series": close_series,
+        "pred_series": pred_series,
+        "mean_err": mean_err,
+        "bias_new": bias_new,
+        "sigma_real": sigma_real,
+        "sigma_pred": sigma_pred,
+        "smooth_factor": smooth_factor,
+        "pred_smoothed": pred_smoothed,
+        "last_pred_corr": last_pred_corr,
+    }
+
+# pip install pmdarima
+from pmdarima import auto_arima
+
+def arima_residual_correction(
+    symbol: str,
+    model_name: str,
+    step_index: int,
+    end_ts,                    # 这一根K线收盘时刻（tz-aware，与你库一致的 :59）
+    yhat_lstm_corr: float,     # 这次 LSTM 的“已做bias修正”的预测（pred_corr基准）
+    lookback: int = 200,       # 残差窗口长度（100~300都可以）
+    seasonal: bool = False,    # 一般分钟级别不开季节项
+    max_pq: int = 3            # auto_arima 搜索阶
+):
+
+
+
+    """
+    返回 (yhat_final, err_forecast, arima_order, aic)
+    若数据不足或失败，则返回 (yhat_lstm_corr, 0.0, None, None)
+    """
+    # 1) 拉最近 lookback 个“预测-真实”的对齐点
+    preds = (ModelPrediction.objects
+             .filter(symbol=symbol, model_name=model_name, step_index=step_index,
+                     predicted_for__lte=end_ts)
+             .order_by("-predicted_for")
+             .values("predicted_for", "pred_corr")[:lookback])
+    preds = list(preds)[::-1]  # 升序
+
+    if not preds:
+        return yhat_lstm_corr, 0.0, None, None
+
+    ts_list = [p["predicted_for"] for p in preds]
+    pred_map = {p["predicted_for"]: float(p["pred_corr"]) for p in preds if p["pred_corr"] is not None}
+
+    candles = (MarketCandle.objects
+               .filter(symbol=symbol, timestamp__in=ts_list)
+               .values("timestamp", "close"))
+    close_map = {c["timestamp"]: float(c["close"]) for c in candles}
+
+    # 对齐
+    pairs = [(t, close_map[t], pred_map[t]) for t in ts_list if t in close_map and t in pred_map]
+    if len(pairs) < 30:  # 保底长度，太短不稳
+        return yhat_lstm_corr, 0.0, None, None
+
+    closes = np.array([x[1] for x in pairs], dtype=float)
+    preds_corr = np.array([x[2] for x in pairs], dtype=float)
+
+    # 2) 残差序列
+    resid = closes - preds_corr
+
+    # 3) 用 auto_arima 在残差上选阶并拟合
+    try:
+        arima = auto_arima(
+            resid,
+            start_p=0, start_q=0,
+            max_p=max_pq, max_q=max_pq,
+            seasonal=seasonal, m=1,
+            information_criterion="aic",
+            stepwise=True, suppress_warnings=True, error_action="ignore"
+        )
+        # 4) 预测下一步残差
+        err_forecast = float(arima.predict(n_periods=1)[0])
+        order = arima.order
+        aic = float(arima.aic())
+    except Exception:
+        return yhat_lstm_corr, 0.0, None, None
+
+    # 5) 合成最终预测
+    yhat_final = yhat_lstm_corr + err_forecast
+    return yhat_final, err_forecast, order, aic

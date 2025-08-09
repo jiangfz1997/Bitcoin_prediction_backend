@@ -25,7 +25,7 @@ SECRET_KEY = 'django-insecure-gbckgs7f_lk7czk_uz+_+=m3%e@7^zr2jq8uu2(+q7bl*1n=xk
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['host.docker.internal']
+ALLOWED_HOSTS = ['host.docker.internal', 'localhost', '127.0.0.1']
 
 
 # Application definition
@@ -76,15 +76,16 @@ WSGI_APPLICATION = 'Realtime_predict.wsgi.application'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
 DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
-        'OPTIONS': {
-            'timeout': 5,
-        }
+    "default": {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": "appdb",
+        "USER": "app",
+        "PASSWORD": "app123",
+        "HOST": "127.0.0.1",
+        "PORT": "5432",
+        "CONN_MAX_AGE": 60,
     }
 }
-
 
 # Password validation
 # https://docs.djangoproject.com/en/5.2/ref/settings/#auth-password-validators
