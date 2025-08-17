@@ -5,7 +5,7 @@ import xgboost as xgb
 
 LAGS = [1, 2, 4, 8, 16, 32, 96]
 ROLL_WINDOWS = [4, 16, 96, 192]
-TARGET_HORIZON = 1  # 可选，用于训练时生成 label
+TARGET_HORIZON = 1
 
 FEATURE_COLS = (
     ["return_1", "return_4", "return_16"] +
@@ -24,7 +24,6 @@ FEATURES = meta["features"]
 BEST_IT = meta.get("best_iteration")
 
 MODEL_FILE = os.path.join(model_path, "xgb_model.ubj")
-print("加载模型路径:", MODEL_FILE)
 
 bst = xgb.Booster()
 bst.load_model(MODEL_FILE)

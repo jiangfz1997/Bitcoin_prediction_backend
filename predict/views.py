@@ -10,13 +10,12 @@ from .models import ModelPrediction, MarketCandle
 
 MODEL = os.environ.get("MODEL", "LSTM-v1")
 class ModelPredictionViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = ModelPrediction.objects.all()  # 供 DRF 推断 basename
+    queryset = ModelPrediction.objects.all()
     serializer_class = ModelPredictionSerializer
 
     def get_queryset(self):
         qs = ModelPrediction.objects.all()
 
-        # 可选过滤参数：?symbol=BTCUSDT&model_name=LSTM-v1&step_index=1
         symbol     = self.request.query_params.get("symbol")
         model_name = self.request.query_params.get("model_name") or self.request.query_params.get("model")
         step       = self.request.query_params.get("step_index")
@@ -30,18 +29,16 @@ class ModelPredictionViewSet(viewsets.ReadOnlyModelViewSet):
         else:
             qs = qs.filter(step_index=1)  # 默认只看第1步（t+1）
 
-        # 用新字段排序；取最近200条
         return qs.order_by("-predicted_for")[:200]
 
 
 def get_predictions(request):
-    """按时间范围返回模型预测数据（兼容老字段名：timestamp/pred）"""
     start_time = request.GET.get("from")
     end_time   = request.GET.get("to")
     limit      = request.GET.get("limit")
     symbol     = request.GET.get("symbol")
     model_name = request.GET.get("model_name")
-    step       = request.GET.get("step_index") or "1"   # 默认只看第1步
+    step       = request.GET.get("step_index") or "1"
 
     qs = ModelPrediction.objects.all()
 
@@ -52,7 +49,6 @@ def get_predictions(request):
     if step:
         qs = qs.filter(step_index=int(step))
 
-    # 时间过滤基于 predicted_for
     if start_time:
         dt = parse_datetime(start_time)
         if dt:
@@ -62,17 +58,15 @@ def get_predictions(request):
         if dt:
             qs = qs.filter(predicted_for__lte=dt)
 
-    qs = qs.order_by("predicted_for")  # 时间升序方便画图
+    qs = qs.order_by("predicted_for")
     if limit:
         qs = qs[:int(limit)]
 
-    # 输出映射：predicted_for -> timestamp，pred_corr -> pred
     data = [
         {
             "timestamp": obj.predicted_for,
             "model_name": obj.model_name,
             "pred": obj.pred_corr,
-            # 如需调试也可额外返回 raw/bias：
             # "pred_raw": obj.pred_raw, "bias_used": obj.bias_used
         }
         for obj in qs
@@ -81,7 +75,6 @@ def get_predictions(request):
 
 
 def get_market_candles(request):
-    """按时间范围返回市场K线数据"""
     start_time = request.GET.get("from")
     end_time   = request.GET.get("to")
     limit      = request.GET.get("limit")
@@ -140,7 +133,6 @@ def get_pred_and_actual(request):
         pred_qs = pred_qs.filter(predicted_for__lte=end_dt)
     pred_qs = pred_qs.order_by("predicted_for")
 
-    # 用 predicted_for 对齐到 candle.timestamp
     pred_dict = {
         p.predicted_for: {
             "pred_corr": p.pred_corr,
@@ -162,12 +154,6 @@ def get_pred_and_actual(request):
         })
     return JsonResponse(result, safe=False)
 def list_models(request):
-    """
-    返回可用的模型名列表。
-    可选参数：
-      - symbol: 只统计该交易对下出现过的模型名
-      - since: 只统计该时间之后产生过预测的模型（ISO时间，UTC）
-    """
     qs = ModelPrediction.objects.all()
 
     symbol = request.GET.get("symbol")
