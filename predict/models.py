@@ -1,4 +1,5 @@
 # models.py
+from django.contrib.postgres.fields import ArrayField
 from django.db import models
 
 class MarketCandle(models.Model):
@@ -70,3 +71,12 @@ class ModelPrediction(models.Model):
 
     def __str__(self):
         return f"{self.symbol} {self.predicted_for} | {self.model_name} [k={self.step_index}] -> {self.pred_corr:.2f}"
+
+class MinuteFeature(models.Model):
+    price = models.OneToOneField(MarketCandle, on_delete=models.CASCADE,
+                                 primary_key=True, related_name="feature")
+    vec = ArrayField(models.FloatField())
+    base_close = models.FloatField()
+
+    class Meta:
+        db_table = "prices_minute_feature"
